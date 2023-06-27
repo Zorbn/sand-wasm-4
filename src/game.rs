@@ -5,7 +5,8 @@ const CHUNK_SIZE: usize = 160;
 // The chunk bitmap is 2BPP so 4 pixels fit in a byte.
 const CHUNK_BITMAP_LENGTH: usize = CHUNK_SIZE * CHUNK_SIZE / 4;
 const AIR_COLOR: u8 = 0;
-const PARTICLE_TYPES: [ParticleType; 2] = [
+const WALL_COLOR: u8 = 2;
+const PARTICLE_TYPES: [ParticleType; 3] = [
     // Air:
     ParticleType {
         color: AIR_COLOR,
@@ -16,18 +17,27 @@ const PARTICLE_TYPES: [ParticleType; 2] = [
         color: 1,
         has_gravity: true,
     },
+    // Wall:
+    ParticleType {
+        color: WALL_COLOR,
+        has_gravity: false,
+    },
 ];
-
-// TODO: Add brushes that follow the 1BPP format.
+const BRUSH_RADIUS: i16 = 8;
+const BRUSH_RADIUS_SQUARED: i16 = BRUSH_RADIUS * BRUSH_RADIUS;
 
 pub struct Game {
     particles: [u8; CHUNK_BITMAP_LENGTH],
+    frame_count: usize,
+    prefer_right: bool,
 }
 
 impl Game {
     pub const fn new() -> Self {
         Self {
             particles: [0x0; CHUNK_BITMAP_LENGTH],
+            frame_count: 0,
+            prefer_right: false,
         }
     }
 
@@ -42,24 +52,46 @@ impl Game {
     pub fn update(&mut self, mouse: u8, mouse_x: i16, mouse_y: i16) {
         self.process_input(mouse, mouse_x, mouse_y);
 
-        for y in (0..(CHUNK_SIZE - 1)).rev() {
-            for x in 0..CHUNK_SIZE {
-                let pixel = self.get_pixel(x, y);
-                let particle_type = &PARTICLE_TYPES[pixel as usize];
-                match particle_type.has_gravity {
-                    true => {
-                        let below_pixel = self.get_pixel(x, y + 1);
-                        if below_pixel == AIR_COLOR {
-                            self.set_pixel(x, y, AIR_COLOR);
-                            self.set_pixel(x, y + 1, particle_type.color);
-                        }
-                    }
-                    false => {}
+        self.prefer_right = self.frame_count & 1 == 0;
+
+        if self.prefer_right {
+            for y in (0..(CHUNK_SIZE as i16)).rev() {
+                for x in 0..(CHUNK_SIZE as i16) {
+                    self.update_particle(x, y);
+                }
+            }
+        } else {
+            for y in (0..(CHUNK_SIZE as i16)).rev() {
+                for x in (0..(CHUNK_SIZE as i16)).rev() {
+                    self.update_particle(x, y);
                 }
             }
         }
 
         self.draw();
+
+        self.frame_count += 1;
+    }
+
+    fn update_particle(&mut self, x: i16, y: i16) {
+        let pixel = self.get_pixel(x, y);
+        let particle_type = &PARTICLE_TYPES[pixel as usize];
+        match particle_type.has_gravity {
+            true => {
+                if self.move_pixel(particle_type, x, y, 0, 1) {
+                    return;
+                }
+
+                if self.prefer_right {
+                    if !self.move_pixel(particle_type, x, y, 1, 1) {
+                        self.move_pixel(particle_type, x, y, -1, 1);
+                    }
+                } else if !self.move_pixel(particle_type, x, y, -1, 1) {
+                    self.move_pixel(particle_type, x, y, 1, 1);
+                }
+            }
+            false => {}
+        }
     }
 
     fn process_input(&mut self, mouse: u8, mouse_x: i16, mouse_y: i16) {
@@ -72,26 +104,48 @@ impl Game {
         }
 
         if mouse & MOUSE_LEFT != 0 {
-            self.set_pixel(mouse_x as usize, mouse_y as usize, 1);
+            self.set_pixel_with_brush(mouse_x, mouse_y, 1);
         } else if mouse & MOUSE_RIGHT != 0 {
-            self.set_pixel(mouse_x as usize, mouse_y as usize, 0);
+            self.set_pixel_with_brush(mouse_x, mouse_y, 0);
         }
     }
 
     fn draw(&mut self) {
         unsafe { *DRAW_COLORS = 0x4321 }
-        Game::mem_blit(
-            &self.particles,
-            0,
-            0,
-            CHUNK_SIZE,
-            CHUNK_SIZE,
-        );
+        Game::mem_blit(&self.particles, 0, 0, CHUNK_SIZE, CHUNK_SIZE);
         unsafe { *DRAW_COLORS = 2 }
         text("hi", 0, 0);
     }
 
-    fn set_pixel(&mut self, x: usize, y: usize, color: u8) {
+    fn set_pixel_with_brush(&mut self, x: i16, y: i16, color: u8) {
+        for iy in -BRUSH_RADIUS..BRUSH_RADIUS {
+            for ix in -BRUSH_RADIUS..BRUSH_RADIUS {
+                if ix * ix + iy * iy < BRUSH_RADIUS_SQUARED {
+                    self.set_pixel(x + ix, y + iy, color);
+                }
+            }
+        }
+    }
+
+    fn move_pixel(&mut self, particle_type: &ParticleType, x: i16, y: i16, dir_x: i16, dir_y: i16) -> bool {
+        if self.get_pixel(x + dir_x, y + dir_y) != AIR_COLOR {
+            return false;
+        }
+
+        self.set_pixel(x, y, AIR_COLOR);
+        self.set_pixel(x + dir_x, y + dir_y, particle_type.color);
+
+        true
+    }
+
+    fn set_pixel(&mut self, x: i16, y: i16, color: u8) {
+        if x < 0 || x >= CHUNK_SIZE as i16 || y < 0 || y >= CHUNK_SIZE as i16 {
+            return;
+        }
+
+        let x = x as usize;
+        let y = y as usize;
+
         // The byte index into the framebuffer that contains (x, y)
         let i = (y * CHUNK_SIZE + x) >> 2;
 
@@ -104,7 +158,14 @@ impl Game {
         self.particles[i] = (color << shift) | (self.particles[i] & !mask);
     }
 
-    fn get_pixel(&mut self, x: usize, y: usize) -> u8 {
+    fn get_pixel(&mut self, x: i16, y: i16) -> u8 {
+        if x < 0 || x >= CHUNK_SIZE as i16 || y < 0 || y >= CHUNK_SIZE as i16 {
+            return WALL_COLOR;
+        }
+
+        let x = x as usize;
+        let y = y as usize;
+
         // The byte index into the framebuffer that contains (x, y)
         let i = (y * CHUNK_SIZE + x) >> 2;
 
@@ -130,7 +191,8 @@ impl Game {
         for iy in 0..visible_height {
             let src_i = ((src_y + iy) * width + src_x) >> 2;
             let dst_i = ((dst_y + iy) * SCREEN_SIZE + dst_x) >> 2;
-            framebuffer[dst_i..(dst_i+visible_width)].copy_from_slice(&sprite[src_i..(src_i+visible_width)]);
+            framebuffer[dst_i..(dst_i + visible_width)]
+                .copy_from_slice(&sprite[src_i..(src_i + visible_width)]);
         }
     }
 }
